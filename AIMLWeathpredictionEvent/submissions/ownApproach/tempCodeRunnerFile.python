@@ -1,0 +1,99 @@
+import pandas as pd 
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+from torch.utils.data import DataLoader, TensorDataset
+
+# Load your cleaned data
+df = pd.read_csv('processedData_cleaned.csv')
+df['Full date'] = pd.to_datetime(df['Full date'])
+
+# Extract day and month for grouping
+df['Day'] = df['Full date'].dt.day
+df['Month'] = df['Full date'].dt.month
+
+# Group by Day and Month, and get the max temperature for each day in each year
+max_temp_per_day = df.groupby(['Month', 'Day', 'Year'])['Temp Max'].max().reset_index()
+
+# Pivot the DataFrame to have years as columns and days as rows
+pivot_df = max_temp_per_day.pivot_table(index=['Month', 'Day'], columns='Year', values='Temp Max').reset_index()
+
+# Create a new column for the date
+pivot_df['Date'] = pd.to_datetime(pivot_df[['Month', 'Day']].assign(Year=2000))
+
+# Rearranging the DataFrame to have Date as the first column
+pivot_df = pivot_df[['Date'] + [col for col in pivot_df.columns if col not in ['Month', 'Day', 'Date']]]
+
+# Convert the pivot DataFrame to the desired two-column format
+two_column_df = pivot_df.melt(id_vars=['Date'], var_name='Year', value_name='Temp Max')
+
+# Group by Date and aggregate values into lists
+two_column_df = two_column_df.groupby('Date')['Temp Max'].apply(list).reset_index()
+two_column_df.columns = ['Date', 'Temperature List']
+
+# Prepare the data for LSTM
+lists = list(two_column_df['Temperature List'])
+sizeOfArray = len(lists[0])
+X = [x[:sizeOfArray-1] for x in lists]  # Extracting all but the last element
+Y = [x[sizeOfArray-1] for x in lists]    # Extracting the last element
+
+# Convert to numpy arrays and reshape
+X = np.array(X).reshape(len(X), sizeOfArray - 1, 1)  # 1 feature for LSTM
+Y = np.array(Y)
+
+# Convert to torch tensors
+X_tensor = torch.from_numpy(X).float()
+Y_tensor = torch.from_numpy(Y).float()
+
+# Create TensorDataset and DataLoader
+dataset = TensorDataset(X_tensor, Y_tensor)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+# Define the LSTM model
+class LSTMRegressor(nn.Module):
+    def __init__(self):
+        super(LSTMRegressor, self).__init__()
+        self.lstm1 = nn.LSTM(input_size=1, hidden_size=50, batch_first=True)
+        self.dropout1 = nn.Dropout(0.2)
+        self.lstm2 = nn.LSTM(input_size=50, hidden_size=50, batch_first=True)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc = nn.Linear(in_features=50, out_features=1)  # Output layer
+
+    def forward(self, x):
+        x, _ = self.lstm1(x)
+        x = self.dropout1(x)
+        x, _ = self.lstm2(x)
+        x = self.dropout2(x)
+        x = x[:, -1, :]  # Get the last time step
+        x = self.fc(x)  # Output layer
+        return x
+
+# Initialize model, loss function, and optimizer
+model = LSTMRegressor()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Training loop
+epochs = 300
+for epoch in range(epochs):
+    model.train()
+    for inputs, targets in dataloader:
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs.squeeze(), targets)
+        loss.backward()
+        optimizer.step()
+
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}')
+
+# Calculate R² score on the training data
+model.eval()  # Set the model to evaluation mode
+with torch.no_grad():
+    train_predictions = model(X_tensor).squeeze().numpy()  # Predictions on training data
+
+# Calculate R² score
+train_r2 = r2_score(Y_tensor.numpy(), train_predictions)
+print(f'R² Score on Training Data: {train_r2:.4f}')
